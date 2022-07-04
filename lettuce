@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+import argparse
+import collections
+import glob
+import gzip
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+import urllib.request
+import yaml
+
+import bibtexparser
+from bibtexparser import bparser as bp
+from pylatexenc import latexwalker as lw
+
+COMMANDS = ['setup', 'add', 'update', 'pull-acl', 'list']
+ERROR_MESSAGE = 'Usage: {} [{}] <command flags>'.format(
+        sys.argv[0], '|'.join(sorted(COMMANDS)))
+CITE_MACROS = ['cite', 'citep', 'citet', 'citep*', 'citet*', 'citeauthor', 'citeyear']
+
+# Files
+ROOT_DIR = pathlib.Path(__file__).resolve().parent
+PROJECTS_FILE = os.path.join(ROOT_DIR, 'projects.yml')
+ASSETS_DIR = os.path.join(ROOT_DIR, 'assets')
+OVERLEAF_DIR = os.path.join(ROOT_DIR, 'overleaf')
+ACL_ANTHOLOGY_URL = 'https://aclanthology.org/anthology.bib.gz'
+ACL_ANTHOLOGY_GZ_PATH = os.path.join(ASSETS_DIR, 'anthology.bib.gz')
+ACL_ANTHOLOGY_PATH = os.path.join(ASSETS_DIR, 'anthology.bib')
+CUSTOM_BIB_PATH = os.path.join(ROOT_DIR, 'custom.bib')
+BIBTEX_NAME = 'refs.bib'
+
+OPTS = None
+
+def parse_args():
+    if len(sys.argv) == 1:
+        print(ERROR_MESSAGE, file=sys.stderr)
+        sys.exit(1)
+    command = sys.argv[1]
+    if command not in COMMANDS:
+        print(ERROR_MESSAGE, file=sys.stderr)
+        sys.exit(1)
+    new_argv = sys.argv[2:]
+    parser = argparse.ArgumentParser(f'{sys.argv[0]} {command}')
+    if command == 'add':
+        parser.add_argument('name', help='Name of project')
+        parser.add_argument('overleaf_id', help='Overleaf ID of project')
+    elif command == 'update':
+        parser.add_argument('name', help='Name of project')
+        parser.add_argument('--force', '-f', action='store_true', 
+                            help='Push .bib even if not all refs are found') 
+    if command in ('add', 'update') and len(sys.argv) == 1:
+        parser.print_help()
+        sys.exit(1)
+    return command, parser.parse_args(new_argv)
+
+def load_projects():
+    with open(PROJECTS_FILE) as f:
+        projects = yaml.safe_load(f)
+    if not projects:
+        return []
+    else:
+        return projects
+
+def run_setup():
+    # Set up file structure
+    print('Creating file structure...')
+    pathlib.Path(PROJECTS_FILE).touch()
+    pathlib.Path(ASSETS_DIR).mkdir(exist_ok=True)
+    pathlib.Path(OVERLEAF_DIR).mkdir(exist_ok=True)
+
+    # Pull ACL Anthology
+    run_pull_acl()
+
+    print('Setup complete.')
+
+def run_add():
+    # Check for duplicates
+    projects = load_projects()
+    for p in projects:
+        if p['name'] == OPTS.name:
+            raise ValueError(f'Project with name {OPTS.name} already exists')
+        if p['overleaf_id'] == OPTS.overleaf_id:
+            raise ValueError(f'Project with ID {OPTS.overleaf_id} already exists')
+
+    # Clone the Overleaf git repository
+    os.chdir(OVERLEAF_DIR)
+    subprocess.run(['git', 'clone', f'https://git.overleaf.com/{OPTS.overleaf_id}', OPTS.name])
+
+    # Save to projects list
+    projects.append({'name': OPTS.name, 'overleaf_id': OPTS.overleaf_id})
+    with open(PROJECTS_FILE, 'w') as f:
+        yaml.dump(projects, f)
+
+def get_project(name):
+    projects = load_projects()
+    for p in projects:
+        if p['name'] == name:
+            return (p['name'], p['overleaf_id'])
+    raise KeyError(f'No project with name {name}')
+
+def _find_refs_from_node(refs, filename, node):
+    if node.isNodeType(lw.LatexMacroNode) and node.macroname in CITE_MACROS:
+        # Found a \cite node
+        for arg in node.nodeargd.argnlist:
+            if arg and arg.isNodeType(lw.LatexGroupNode):
+                char_node = arg.nodelist[0]
+                assert char_node.isNodeType(lw.LatexCharsNode)
+                cur_refs = [x.strip() for x in char_node.chars.split(',')]
+                for r in cur_refs:
+                    refs[r].add(filename)
+    if node.isNodeType(lw.LatexMacroNode) or node.isNodeType(lw.LatexEnvironmentNode):
+        # Recursive case for arguments
+        if node.nodeargd:
+            for arg in node.nodeargd.argnlist:
+                if arg:
+                    _find_refs_from_node(refs, filename, arg)
+    if node.isNodeType(lw.LatexGroupNode) or node.isNodeType(lw.LatexEnvironmentNode):
+        # Recursive case for content within environments/groups
+        for arg in node.nodelist:
+            if arg:
+                _find_refs_from_node(refs, filename, arg)
+
+def find_refs(project_dir):
+    refs = collections.defaultdict(set)
+    for filename in glob.glob(os.path.join(project_dir, '*.tex')):
+        print(f'Processing {filename}...')
+        relative_filename = pathlib.Path(filename).relative_to(project_dir).name
+        with open(filename) as f:
+            tex = f.read()
+        w = lw.LatexWalker(tex)
+        nodelist, pos, length = w.get_latex_nodes()
+        for node in nodelist:
+            _find_refs_from_node(refs, relative_filename, node)
+
+    print(refs)
+    return refs
+
+def add_entries(id_to_entry, bib):
+    for entry in bib.entries:
+        if entry['ID'] in id_to_entry:
+            print('Warning: Duplicate BibTeX entry {}'.format(entry['ID']))
+        id_to_entry[entry['ID']] = entry
+
+def load_bib_with_hints(bib_file, refs):
+    """Load the given .bib file but only keep entries with relevant IDs.
+    
+    We need this because parsing the whole ACL Anthology file with bibtexparser
+    takes too long.
+
+    We're not worried about catching entries that aren't actually relevant,
+    as long as we reduce the number of bibtexparser calls to a reasonable 
+    number.
+    """
+    parser = bp.BibTexParser(common_strings=True)
+    regex = re.compile('|'.join(refs))
+    kept_lines = []
+    is_relevant = False
+    with open(bib_file) as f:
+        for line in f:
+            if line.startswith('@'):
+                is_relevant = re.search(regex, line)
+            if is_relevant:
+                kept_lines.append(line)
+    kept_string = ''.join(kept_lines)
+    return parser.parse(kept_string)
+
+def find_bib_entries(refs):
+    print('Loading custom.bib...')
+    custom_bib = load_bib_with_hints(CUSTOM_BIB_PATH, refs)
+    print('Loading ACL Anthology BibTeX...')
+    acl_bib = load_bib_with_hints(ACL_ANTHOLOGY_PATH, refs)
+    id_to_entry = {}
+    add_entries(id_to_entry, acl_bib)
+    add_entries(id_to_entry, custom_bib)
+
+    print('Locating matching entries for references...')
+    bib_entries = []
+    found_all = True
+    for ref in refs:
+        if ref in id_to_entry:
+            bib_entries.append(id_to_entry[ref])
+        else:
+            print(f'Warning: No BibTeX entry found for {ref}')
+            found_all = False
+    return bib_entries, found_all
+
+def write_bib(bib_entries, filename):
+    db = bibtexparser.bibdatabase.BibDatabase()
+    db.entries = sorted(bib_entries, key=lambda x: x['ID'])
+    with open(filename, 'w') as f:
+        bibtexparser.dump(db, f)
+
+def run_update():
+    name, overleaf_id = get_project(OPTS.name)
+    project_dir = os.path.join(OVERLEAF_DIR, name)
+
+    # Pull the Overleaf git repository
+    print('Pulling Overleaf changes...')
+    os.chdir(project_dir)
+    subprocess.run(['git', 'pull'])
+
+    # Find refs
+    refs = find_refs(project_dir)
+
+    # Match citations
+    bib_entries, found_all = find_bib_entries(refs)
+    if not found_all and not OPTS.force:
+        print('Missing refs detected, exiting.')
+        sys.exit(1)
+
+    # Write BibTeX
+    bibtex_path = os.path.join(project_dir, BIBTEX_NAME)
+    write_bib(bib_entries, os.path.join(bibtex_path))
+
+    # Commit and push updates
+    print('Pushing to Overleaf...')
+    subprocess.run(['git', 'add', BIBTEX_NAME])
+    subprocess.run(['git', 'commit', '-m', 'Update references'])
+    subprocess.run(['git', 'push'])
+
+def run_pull_acl():
+    print('Downloading ACL Anthology BibTeX...')
+    urllib.request.urlretrieve(ACL_ANTHOLOGY_URL, ACL_ANTHOLOGY_GZ_PATH)
+    with gzip.open(ACL_ANTHOLOGY_GZ_PATH) as f_in:
+        with open(ACL_ANTHOLOGY_PATH, 'wb') as f_out:
+            shutil.copyfileobj(f_in, f_out)
+
+def run_list():
+    projects = load_projects()
+    projects.sort(key=lambda x: x['name'])
+    print(f'Available projects ({len(projects)} total):')
+    for p in projects:
+        print('    * {}: https://www.overleaf.com/project/{}'.format(
+                p['name'], p['overleaf_id']))
+
+def main(command):
+    if command == 'setup':
+        run_setup()
+    elif command == 'add':
+        run_add()
+    elif command == 'update':
+        run_update()
+    elif command == 'pull-acl':
+        run_pull_acl()
+    elif command == 'list':
+        run_list()
+    else:
+        raise ValueError(command)
+
+if __name__ == '__main__':
+    command, OPTS = parse_args()
+    main(command)
