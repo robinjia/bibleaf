@@ -20,6 +20,8 @@ COMMANDS = ['setup', 'add', 'update', 'pull-acl', 'list']
 ERROR_MESSAGE = 'Usage: {} [{}] <command flags>'.format(
         sys.argv[0], '|'.join(sorted(COMMANDS)))
 CITE_MACROS = ['cite', 'citep', 'citet', 'citep*', 'citet*', 'citeauthor', 'citeyear']
+KEYS_TO_DELETE = ['address', 'doi', 'isbn', 'keywords', 'location', 'month', 'number', 'numpages', 'pages', 'series', 'volume']
+NON_BOOK_KEYS_TO_DELETE = ['editor', 'publisher']
 
 # Files
 ROOT_DIR = pathlib.Path(__file__).resolve().parent
@@ -51,6 +53,8 @@ def parse_args():
         parser.add_argument('name', help='Name of project')
         parser.add_argument('--force', '-f', action='store_true', 
                             help='Push .bib even if not all refs are found') 
+        parser.add_argument('--no-url', action='store_true',
+                            help='Delete url field from BibTeX entries')
     if command in ('add', 'update') and len(sys.argv) == 1:
         parser.print_help()
         sys.exit(1)
@@ -138,10 +142,22 @@ def find_refs(project_dir):
     print(refs)
     return refs
 
+def compress_entry(entry):
+    for k in KEYS_TO_DELETE:
+        if k in entry:
+            del entry[k]
+    if entry['ENTRYTYPE'] != 'book':
+        for k in NON_BOOK_KEYS_TO_DELETE:
+            if k in entry:
+                del entry[k]
+    if OPTS.no_url and 'url' in entry:
+        del entry['url']
+
 def add_entries(id_to_entry, bib):
     for entry in bib.entries:
         if entry['ID'] in id_to_entry:
             print('Warning: Duplicate BibTeX entry {}'.format(entry['ID']))
+        compress_entry(entry)
         id_to_entry[entry['ID']] = entry
 
 def load_bib_with_hints(bib_file, refs):

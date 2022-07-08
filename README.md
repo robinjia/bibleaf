@@ -1,18 +1,18 @@
-# Lettuce
+# Bibleaf
 A tool for managing BibTeX bibliographies with Overleaf documents.
 
 ## Setup
 Setup is as simple as running:
 
 ```
-./lettuce setup
+./bibleaf setup
 ```
 
 ## Usage 
 1. Add an overleaf project:
 
 ```
-./lettuce add [project_name] [overleaf_id]
+./bibleaf add [project_name] [overleaf_id]
 ```
 The overleaf ID is what comes after `https://www.overleaf.com/project/` in the Overleaf URL.
 The name can be anything you want but must be unique across all your projects.
@@ -22,7 +22,7 @@ Running this command will pull the contents of this project and store them in `o
 2. Update the project:
 
 ```
-./lettuce update [project_name]
+./bibleaf update [project_name]
 ```
 
 This command does the following:
@@ -39,12 +39,12 @@ This command does the following:
 Update the cached ACL anthology BibTeX:
 
 ```
-./lettuce pull-acl
+./bibleaf pull-acl
 ```
 
 List all projects:
 ```
-./lettuce list
+./bibleaf list
 ```
 
 ## Saving your Overleaf account information
