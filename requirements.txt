@@ -1,2 +1,4 @@
 bibtexparser
+nltk
 pylatexenc
+unidecode

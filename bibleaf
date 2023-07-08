@@ -3,36 +3,58 @@ import argparse
 import collections
 import glob
 import gzip
+import nltk
 import os
 import pathlib
 import re
 import shutil
 import subprocess
 import sys
+from unidecode import unidecode
 import urllib.request
+from xml.etree import ElementTree
 import yaml
 
 import bibtexparser
 from bibtexparser import bparser as bp
 from pylatexenc import latexwalker as lw
+from pylatexenc import latexencode as le
 
-COMMANDS = ['setup', 'add', 'update', 'pull-acl', 'list']
+COMMANDS = ['setup', 'add', 'update', 'pull-acl', 'pull-arxiv', 'list']
 ERROR_MESSAGE = 'Usage: {} [{}] <command flags>'.format(
         sys.argv[0], '|'.join(sorted(COMMANDS)))
-CITE_MACROS = ['cite', 'citep', 'citet', 'citep*', 'citet*', 'citeauthor', 'citeyear']
+CITE_MACROS = ['cite', 'citep', 'citet', 'citealp', 'citep*', 'citet*', 'citeauthor', 'citeyear']
 KEYS_TO_DELETE = ['address', 'doi', 'isbn', 'keywords', 'location', 'month', 'number', 'numpages', 'pages', 'series', 'volume']
 NON_BOOK_KEYS_TO_DELETE = ['editor', 'publisher']
+STOPWORDS = nltk.corpus.stopwords.words('english')
 
 # Files
 ROOT_DIR = pathlib.Path(__file__).resolve().parent
 PROJECTS_FILE = os.path.join(ROOT_DIR, 'projects.yml')
 ASSETS_DIR = os.path.join(ROOT_DIR, 'assets')
 OVERLEAF_DIR = os.path.join(ROOT_DIR, 'overleaf')
+CUSTOM_BIB_PATH = os.path.join(ROOT_DIR, 'custom.bib')
+BIBTEX_NAME = 'refs.bib'
+
+# ACL Anthology
 ACL_ANTHOLOGY_URL = 'https://aclanthology.org/anthology.bib.gz'
 ACL_ANTHOLOGY_GZ_PATH = os.path.join(ASSETS_DIR, 'anthology.bib.gz')
 ACL_ANTHOLOGY_PATH = os.path.join(ASSETS_DIR, 'anthology.bib')
-CUSTOM_BIB_PATH = os.path.join(ROOT_DIR, 'custom.bib')
-BIBTEX_NAME = 'refs.bib'
+
+# arXiv
+ARXIV_REGEX = r'/[a-z]+/([0-9]+\.[0-9]+)([^0-9].*)?'
+ARXIV_IDS_PATH = os.path.join(ROOT_DIR, 'arxiv_ids.txt')
+ARXIV_BIB_PATH = os.path.join(ASSETS_DIR, 'arxiv.bib')
+
+
+# booktitle shortening  
+CONFERENCE_SHORT_NAMES = [
+        (re.compile(r'Proceedings of the [0-9a-z]+ Annual Meeting of the Association for Computational Linguistics.*'), 'Association for Computational Linguistics'),
+        (re.compile(r'Proceedings of the [0-9a-z]+ Conference on Empirical Methods in Natural Language Processing.*'), 'Empirical Methods in Natural Language Processing'),
+        (re.compile(r'Proceedings of the [0-9a-z]+ Conference of the North American Chapter of the Association for Computational Linguistics.*'), 'North American Association for Computational Linguistics'),
+]
+FINDINGS_PATTERN = re.compile('Findings of the Association for Computational Linguistics: ([-A-Z]+) ([0-9]+)')
+PROCEEDINGS_PATTERN = re.compile('Proceedings of the ([0-9]+(st|nd|rd|th) )?(.*)')
 
 OPTS = None
 
@@ -55,6 +77,12 @@ def parse_args():
                             help='Push .bib even if not all refs are found') 
         parser.add_argument('--no-url', action='store_true',
                             help='Delete url field from BibTeX entries')
+        parser.add_argument('--shorten-booktitle', '-s', action='store_true',
+                            help='Shorten booktitle fields')
+        parser.add_argument('--dry-run', '-d', action='store_true',
+                            help='Do not pull or push from Overleaf')
+        parser.add_argument('--fast', action='store_true',
+                            help='Run in fast mode (no checking arXiv)') 
     if command in ('add', 'update') and len(sys.argv) == 1:
         parser.print_help()
         sys.exit(1)
@@ -139,8 +167,21 @@ def find_refs(project_dir):
         for node in nodelist:
             _find_refs_from_node(refs, relative_filename, node)
 
-    print(refs)
+    #print(refs)
     return refs
+
+def shorten_booktitle(title):
+    for pattern, name in CONFERENCE_SHORT_NAMES:
+        if re.match(pattern, title):
+            return name
+    m = re.match(FINDINGS_PATTERN, title)
+    if m:
+        return 'Findings of {}'.format(m.group(1))
+    m = re.match(PROCEEDINGS_PATTERN, title)
+    if m:
+        return m.group(3)
+    print(f'Could not shorten title: "{title}"')
+    return title
 
 def compress_entry(entry):
     for k in KEYS_TO_DELETE:
@@ -152,6 +193,8 @@ def compress_entry(entry):
                 del entry[k]
     if OPTS.no_url and 'url' in entry:
         del entry['url']
+    if OPTS.shorten_booktitle and 'booktitle' in entry:
+        entry['booktitle'] = shorten_booktitle(entry['booktitle'])
 
 def add_entries(id_to_entry, bib):
     for entry in bib.entries:
@@ -159,6 +202,11 @@ def add_entries(id_to_entry, bib):
             print('Warning: Duplicate BibTeX entry {}'.format(entry['ID']))
         compress_entry(entry)
         id_to_entry[entry['ID']] = entry
+
+def load_bib(bib_file):
+    parser = bp.BibTexParser(common_strings=True)
+    with open(bib_file) as f:
+        return parser.parse(f.read())
 
 def load_bib_with_hints(bib_file, refs):
     """Load the given .bib file but only keep entries with relevant IDs.
@@ -184,13 +232,18 @@ def load_bib_with_hints(bib_file, refs):
     return parser.parse(kept_string)
 
 def find_bib_entries(refs):
+    if not OPTS.fast:
+        run_pull_arxiv()
     print('Loading custom.bib...')
     custom_bib = load_bib_with_hints(CUSTOM_BIB_PATH, refs)
     print('Loading ACL Anthology BibTeX...')
     acl_bib = load_bib_with_hints(ACL_ANTHOLOGY_PATH, refs)
+    print('Loading arXiv BibTeX...')
+    arxiv_bib = load_bib_with_hints(ARXIV_BIB_PATH, refs)
     id_to_entry = {}
     add_entries(id_to_entry, acl_bib)
     add_entries(id_to_entry, custom_bib)
+    add_entries(id_to_entry, arxiv_bib)
 
     print('Locating matching entries for references...')
     bib_entries = []
@@ -214,9 +267,10 @@ def run_update():
     project_dir = os.path.join(OVERLEAF_DIR, name)
 
     # Pull the Overleaf git repository
-    print('Pulling Overleaf changes...')
-    os.chdir(project_dir)
-    subprocess.run(['git', 'pull'])
+    if not OPTS.dry_run:
+        print('Pulling Overleaf changes...')
+        os.chdir(project_dir)
+        subprocess.run(['git', 'pull'])
 
     # Find refs
     refs = find_refs(project_dir)
@@ -232,10 +286,11 @@ def run_update():
     write_bib(bib_entries, os.path.join(bibtex_path))
 
     # Commit and push updates
-    print('Pushing to Overleaf...')
-    subprocess.run(['git', 'add', BIBTEX_NAME])
-    subprocess.run(['git', 'commit', '-m', 'Update references'])
-    subprocess.run(['git', 'push'])
+    if not OPTS.dry_run:
+        print('Pushing to Overleaf...')
+        subprocess.run(['git', 'add', BIBTEX_NAME])
+        subprocess.run(['git', 'commit', '-m', 'Update references'])
+        subprocess.run(['git', 'push'])
 
 def run_pull_acl():
     print('Downloading ACL Anthology BibTeX...')
@@ -243,6 +298,69 @@ def run_pull_acl():
     with gzip.open(ACL_ANTHOLOGY_GZ_PATH) as f_in:
         with open(ACL_ANTHOLOGY_PATH, 'wb') as f_out:
             shutil.copyfileobj(f_in, f_out)
+
+def run_pull_arxiv():
+    print('Reading arXiv cache...')
+    arxiv_id_to_entry = {}
+    if os.path.isfile(ARXIV_BIB_PATH):
+        bib = load_bib(ARXIV_BIB_PATH)
+        for entry in bib.entries:
+            arxiv_id_to_entry[entry['eprint']] = entry
+
+    # Find which ID's are new
+    new_ids = []
+    with open(ARXIV_IDS_PATH) as f:
+        arxiv_ids = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+    for arxiv_id in arxiv_ids:
+        if arxiv_id not in arxiv_id_to_entry:
+            new_ids.append(arxiv_id)
+    if not new_ids:
+        print('No new arXiv IDs.')
+        return
+
+    print(f'Downloading arXiv metadata for {len(new_ids)} articles...')
+    with urllib.request.urlopen('http://export.arxiv.org/api/query?id_list={}'.format(','.join(new_ids))) as url:
+        r = url.read()
+    tree = ElementTree.fromstring(r)
+    for e in tree:
+        if e.tag == '{http://www.w3.org/2005/Atom}entry':
+            entry = {'archivePrefix': 'arXiv'}
+            authors = []
+            first_author_name = None
+            title_start = None
+            for child in e:
+                if child.tag == '{http://www.w3.org/2005/Atom}updated':
+                    entry['year'] = child.text.split('-')[0]
+                elif child.tag == '{http://www.w3.org/2005/Atom}title':
+                    entry['title'] = le.unicode_to_latex(child.text)
+                    title_words = re.sub(r'[^a-z ]', '', unidecode(child.text).lower()).strip().split()
+                    for w in title_words:
+                        if w not in STOPWORDS:
+                            title_start = w
+                            break
+                    else:
+                        title_start = title_words[0]
+                elif child.tag == '{http://www.w3.org/2005/Atom}id':
+                    entry['url'] = child.text
+                    url = urllib.parse.urlparse(child.text)
+                    entry['eprint'] = re.match(ARXIV_REGEX, url.path).group(1)
+                elif child.tag == '{http://www.w3.org/2005/Atom}author':
+                    for name in child:
+                        if name.tag == '{http://www.w3.org/2005/Atom}name':
+                            authors.append(le.unicode_to_latex(name.text))
+                            if not first_author_name:
+                                # Use the last name of the first author
+                                first_author_name = re.sub(r'[^a-z ]', '', unidecode(name.text).split(' ')[-1].lower())
+            entry['author'] = ' and '.join(authors)
+            entry['ID'] = '{}{}{}'.format(first_author_name, entry['year'], title_start)
+            entry['ENTRYTYPE'] = 'misc'
+            arxiv_id_to_entry[entry['eprint']] = entry
+
+    # Write BibTeX
+    print(f'Writing arXiv BibTeX...')
+    bib_entries = [arxiv_id_to_entry[x] for x in arxiv_ids]
+    write_bib(bib_entries, ARXIV_BIB_PATH)
+    return load_bib(ARXIV_BIB_PATH)
 
 def run_list():
     projects = load_projects()
@@ -261,6 +379,8 @@ def main(command):
         run_update()
     elif command == 'pull-acl':
         run_pull_acl()
+    elif command == 'pull-arxiv':
+        run_pull_arxiv()
     elif command == 'list':
         run_list()
     else:
