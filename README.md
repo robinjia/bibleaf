@@ -2,7 +2,16 @@
 A tool for managing BibTeX bibliographies with Overleaf documents.
 
 ## Setup
-Setup is as simple as running:
+1. It is recommended that you fork this repository to your own local one.
+This will enable you to push your project-specific files to your repository. 
+
+2. Install required packages:
+
+```
+pip3 install -r requirements.txt
+```
+
+3. Run the setup command: 
 
 ```
 ./bibleaf setup
@@ -30,6 +39,7 @@ This command does the following:
 - Scan the `.tex` files for all citations.
 - Attempt to match each citation with a known BibTeX reference from (in order of priority): 
     - Your custom BibTeX file in `custom.bib`
+    - Automatically created entries for the arXiv papers whose ID's are listed in `arxiv_ids.txt`
     - The ACL Anthology (A cached copy of the official ACL Anthology BibTeX is stored in `files/`)
 - If some references were not found, issue a warning and stop. (Force completion of the command anyways with `-f`).
 - Gather the needed BibTeX references into one file called `refs.bib` and push that file to the Overleaf repository.
@@ -56,3 +66,11 @@ git config --global credential.https://git.overleaf.com.helper store
 ```
 
 Note that you can only run the first command to store your email address but prompt for a password every time.
+
+## Automatically created arXiv BibTeX entries
+`bibleaf` will automatically create BibTeX entries for arXiv papers of the format `{name}{year}{title_word}` where: 
+- `name` is the author's last name, lowercased, with all non-alphabetic characters removed
+- `year` is the publication year of the current version of the paper
+- `title_word` is the first non-stopword word of the title, lowercased, with all non-alphabetic characters removed
+
+You can check `assets/arxiv.bib` to see all the BibTeX entries that have been created for your specified arXiv ID's.
