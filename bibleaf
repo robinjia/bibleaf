@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import collections
+import difflib
 import glob
 import gzip
 import os
@@ -9,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from unidecode import unidecode
 import urllib.request
 from xml.etree import ElementTree
@@ -25,6 +27,7 @@ ERROR_MESSAGE = 'Usage: {} [{}] <command flags>'.format(
 CITE_MACROS = ['cite', 'citep', 'citet', 'citealp', 'citep*', 'citet*', 'citeauthor', 'citeyear']
 KEYS_TO_DELETE = ['address', 'doi', 'isbn', 'keywords', 'location', 'month', 'number', 'numpages', 'pages', 'series', 'volume']
 NON_BOOK_KEYS_TO_DELETE = ['editor', 'publisher']
+BIBTEX_ID_REGEX = re.compile(r'@[^{]*\{(\S*),')
 
 # Saved nltk stopwords list because importing nltk is so slow
 STOPWORDS = ['i', 'me', 'my', 'myself', 'we', 'our', 'ours', 'ourselves', 'you', "you're", "you've", "you'll", "you'd", 'your', 'yours', 'yourself', 'yourselves', 'he', 'him', 'his', 'himself', 'she', "she's", 'her', 'hers', 'herself', 'it', "it's", 'its', 'itself', 'they', 'them', 'their', 'theirs', 'themselves', 'what', 'which', 'who', 'whom', 'this', 'that', "that'll", 'these', 'those', 'am', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'having', 'do', 'does', 'did', 'doing', 'a', 'an', 'the', 'and', 'but', 'if', 'or', 'because', 'as', 'until', 'while', 'of', 'at', 'by', 'for', 'with', 'about', 'against', 'between', 'into', 'through', 'during', 'before', 'after', 'above', 'below', 'to', 'from', 'up', 'down', 'in', 'out', 'on', 'off', 'over', 'under', 'again', 'further', 'then', 'once', 'here', 'there', 'when', 'where', 'why', 'how', 'all', 'any', 'both', 'each', 'few', 'more', 'most', 'other', 'some', 'such', 'no', 'nor', 'not', 'only', 'own', 'same', 'so', 'than', 'too', 'very', 's', 't', 'can', 'will', 'just', 'don', "don't", 'should', "should've", 'now', 'd', 'll', 'm', 'o', 're', 've', 'y', 'ain', 'aren', "aren't", 'couldn', "couldn't", 'didn', "didn't", 'doesn', "doesn't", 'hadn', "hadn't", 'hasn', "hasn't", 'haven', "haven't", 'isn', "isn't", 'ma', 'mightn', "mightn't", 'mustn', "mustn't", 'needn', "needn't", 'shan', "shan't", 'shouldn', "shouldn't", 'wasn', "wasn't", 'weren', "weren't", 'won', "won't", 'wouldn', "wouldn't"]
@@ -209,7 +212,7 @@ def load_bib(bib_file):
     with open(bib_file) as f:
         return parser.parse(f.read())
 
-def load_bib_with_hints(bib_file, refs):
+def load_bib_with_hints(bib_file, refs, bib_id_set):
     """Load the given .bib file but only keep entries with relevant IDs.
     
     We need this because parsing the whole ACL Anthology file with bibtexparser
@@ -218,15 +221,24 @@ def load_bib_with_hints(bib_file, refs):
     We're not worried about catching entries that aren't actually relevant,
     as long as we reduce the number of bibtexparser calls to a reasonable 
     number.
+
+    As a side effect, also adds all found ID's from the .bib to bib_id_set.
     """
     parser = bp.BibTexParser(common_strings=True)
-    regex = re.compile('|'.join(refs))
+    ref_set = set(refs)
     kept_lines = []
     is_relevant = False
     with open(bib_file) as f:
         for line in f:
             if line.startswith('@'):
-                is_relevant = re.search(regex, line)
+                m = re.search(BIBTEX_ID_REGEX, line)
+                if m:
+                    bib_id = m.group(1)
+                    bib_id_set.add(bib_id)
+                    is_relevant = bib_id in refs
+                else:
+                    print(f'Warning: Could not parse BibTeX ID from line "{line}"')
+                    is_relevant = False
             if is_relevant:
                 kept_lines.append(line)
     kept_string = ''.join(kept_lines)
@@ -235,16 +247,17 @@ def load_bib_with_hints(bib_file, refs):
 def find_bib_entries(refs):
     if not OPTS.fast:
         run_pull_arxiv()
+    bib_id_set = set()
     print('Loading custom.bib...')
-    custom_bib = load_bib_with_hints(CUSTOM_BIB_PATH, refs)
+    custom_bib = load_bib_with_hints(CUSTOM_BIB_PATH, refs, bib_id_set)
     print('Loading ACL Anthology BibTeX...')
-    acl_bib = load_bib_with_hints(ACL_ANTHOLOGY_PATH, refs)
+    acl_bib = load_bib_with_hints(ACL_ANTHOLOGY_PATH, refs, bib_id_set)
     print('Loading arXiv BibTeX...')
-    arxiv_bib = load_bib_with_hints(ARXIV_BIB_PATH, refs)
+    arxiv_bib = load_bib_with_hints(ARXIV_BIB_PATH, refs, bib_id_set)
     id_to_entry = {}
     add_entries(id_to_entry, acl_bib)
-    add_entries(id_to_entry, custom_bib)
     add_entries(id_to_entry, arxiv_bib)
+    add_entries(id_to_entry, custom_bib)
 
     print('Locating matching entries for references...')
     bib_entries = []
@@ -253,7 +266,11 @@ def find_bib_entries(refs):
         if ref in id_to_entry:
             bib_entries.append(id_to_entry[ref])
         else:
-            print(f'Warning: No BibTeX entry found for {ref}')
+            match_str = ''
+            close_matches = difflib.get_close_matches(ref, bib_id_set)
+            if close_matches:
+                match_str = '. Did you mean: {}?'.format(', '.join(close_matches))
+            print(f'Warning: No BibTeX entry found for {ref}{match_str}')
             found_all = False
     return bib_entries, found_all
 
@@ -310,8 +327,13 @@ def run_pull_arxiv():
 
     # Find which ID's are new
     new_ids = []
+    arxiv_ids = []
     with open(ARXIV_IDS_PATH) as f:
-        arxiv_ids = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+        # Allow comments using '#'
+        for line in f:
+            a = line.split('#')[0].strip()
+            if a:
+                arxiv_ids.append(a)
     for arxiv_id in arxiv_ids:
         if arxiv_id not in arxiv_id_to_entry:
             new_ids.append(arxiv_id)
