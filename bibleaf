@@ -161,7 +161,8 @@ def _find_refs_from_node(refs, filename, node):
 
 def find_refs(project_dir):
     refs = collections.defaultdict(set)
-    for filename in glob.glob(os.path.join(project_dir, '*.tex')):
+    for filename in glob.glob(os.path.join(
+            project_dir, '**', '*.tex'), recursive=True):
         print(f'Processing {filename}...')
         relative_filename = pathlib.Path(filename).relative_to(project_dir).name
         with open(filename) as f:

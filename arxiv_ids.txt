@@ -36,8 +36,6 @@
 2311.09476
 # Isobench
 2404.01266
-# Charlotte localization
-2311.09060
 2404.15574
 2401.04088
 2306.03341
@@ -46,3 +44,5 @@
 1607.06450
 2209.11895
 2402.13055
+2406.13131  # Charlotte parts > sums paper
+2406.03445  # Tianyi addition paper
