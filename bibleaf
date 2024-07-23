@@ -142,6 +142,8 @@ def _find_refs_from_node(refs, filename, node):
         # Found a \cite node
         for arg in node.nodeargd.argnlist:
             if arg and arg.isNodeType(lw.LatexGroupNode):
+                if not arg.nodelist:
+                    continue # Ignore things like \citep{}
                 char_node = arg.nodelist[0]
                 assert char_node.isNodeType(lw.LatexCharsNode)
                 cur_refs = [x.strip() for x in char_node.chars.split(',')]
