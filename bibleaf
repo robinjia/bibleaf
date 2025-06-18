@@ -113,6 +113,7 @@ def run_setup():
     print('Setup complete.')
 
 def run_add():
+    print('Reminder: Use username "git" and password from Overleaf Git authentication token')
     # Check for duplicates
     projects = load_projects()
     for p in projects:
@@ -123,7 +124,7 @@ def run_add():
 
     # Clone the Overleaf git repository
     os.chdir(OVERLEAF_DIR)
-    subprocess.run(['git', 'clone', f'https://git.overleaf.com/{OPTS.overleaf_id}', OPTS.name])
+    subprocess.run(['git', 'clone', f'https://git.overleaf.com/{OPTS.overleaf_id}', OPTS.name], check=True)
 
     # Save to projects list
     projects.append({'name': OPTS.name, 'overleaf_id': OPTS.overleaf_id})
